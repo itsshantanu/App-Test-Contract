@@ -1,0 +1,86 @@
+name: BBApp
+
+on:
+  workflow_dispatch:
+    inputs:
+      projectId:
+        description: 'Project ID'
+        required: true
+
+jobs:
+  check_project_status:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Get Project
+        id: project_status
+        run: |
+          # Fetch project status using the provided projectId
+          PROJECT_ID="${{ github.event.inputs.projectId }}"
+          PROJECT_STATUS=$(curl -s "https://backend.sigma.buildbear.io/app/project/action?projectId=$PROJECT_ID")
+
+          # Extract the test IDs from the project response and convert them to a space-separated string
+          TEST_IDS=$(echo "$PROJECT_STATUS" | jq -r '.projectDetails.tests | @tsv' | tr '\t' ' ')
+          export REPO_NAME=$(echo "$PROJECT_STATUS" | jq -r '.projectDetails.repoName')
+          export PRO_ID=$(echo "$PROJECT_STATUS" | jq -r '.projectDetails.projectId')
+          
+          # Print project status
+          echo "Project Status: $PROJECT_STATUS"
+          echo "Test IDs: $TEST_IDS"
+
+          # Store the test IDs as an output variable
+          echo "::set-output name=testIds::$TEST_IDS"
+        shell: bash
+
+      - name: Get Test Status
+        id: test_status
+        run: |
+          DASHBOARD_URL="https://app.sigma.buildbear.io/deployment?repoName=$REPO_NAME&projectId=$PRO_ID"
+          # Get the test IDs from the previous step's output
+          TEST_IDS="${{ steps.project_status.outputs.testIds }}"
+          
+          # Split the space-separated test IDs into an array
+          IFS=" " read -ra TEST_ID_ARRAY <<< "$TEST_IDS"
+          
+          for TEST_ID in "${TEST_ID_ARRAY[@]}"; do
+            while true; do
+              TEST_STATUS=$(curl -s "https://backend.sigma.buildbear.io/app/test/action/$TEST_ID" | jq -r '.test.status')
+
+              if [ -z "$TEST_STATUS" ]; then
+                echo "Test $TEST_ID has an unknown status: null or missing status"
+                echo "Response: $TEST_RESPONSE"
+                exit 1 # fail the workflow if test status unknown
+              elif [ "$TEST_STATUS" == "success" ]; then
+                echo "Test $TEST_ID has succeeded. Visit your dashboard at $DASHBOARD_URL"
+                echo "Response: $TEST_RESPONSE"
+                break  # Exit the loop for this test
+              elif [ "$TEST_STATUS" == "aborted" ]; then
+                echo "Test $TEST_ID has been aborted. Visit your dashboard at $DASHBOARD_URL"
+                echo "Response: $TEST_RESPONSE"
+                
+                # Create a simple HTML file with a cross and a link to the dashboard
+                echo '<html><body><h1>Cross</h1><p>Test was aborted. <a href="'$DASHBOARD_URL'">View Dashboard</a></p></body></html>' > aborted.html
+                # Upload the HTML file as an artifact
+                echo "::set-output name=artifact_name::aborted.html"
+                break  # Exit the loop for this test
+              elif [ "$TEST_STATUS" == "running" ]; then
+                echo "Test $TEST_ID is still running. Waiting for status to change..."
+                sleep 60  # Wait for 60 seconds before checking again
+              else
+                echo "Test $TEST_ID has an unknown status: $TEST_STATUS"
+                echo "Response: $TEST_RESPONSE"
+                exit 1 # fail the workflow if test status unknown 
+              fi
+            done
+          done
+        shell: bash
+
+      - name: Upload HTML Artifact
+        if: steps.test_status.outputs.artifact_name
+        uses: actions/upload-artifact@v2
+        with:
+          name: ${{ steps.test_status.outputs.artifact_name }}
+          path: aborted.html
